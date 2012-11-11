@@ -13,12 +13,6 @@ EMPTY_DIR = "/tmp/empty"
 if not os.path.exists(EMPTY_DIR):
     os.makedirs(EMPTY_DIR)
 
-#TESTING
-API_KEY = "Jg7jMyKwiXTWCCV863WcifugEl4uerTsaSGfK91ft8OkNiARcN"
-API_SECRET = "Xz3og4GfV6eHjyIiJLwlbkGY2mB3BQ0FqExHJmRJD8LUFo0cay"
-CONSUMER_KEY = "zlt6K3c33CvIMiG8fcQZG6CzqgZajSUp4ZafNcgHDnNSnqWBHG"
-CONSUMER_SECRET = "xckN9FYFXX4dExQoOpigDxfpAtkLX1X8qIUxoCmDakmFEU3c03"
-
 def normalize(s, encoding):
     if not isinstance(s, basestring):
         return s
