@@ -4,6 +4,7 @@ from twisted.internet.defer import Deferred
 from twisted.internet.protocol import Protocol, Factory
 from twisted.web.client import HTTPConnectionPool, Agent, ResponseDone
 from twisted.web.http_headers import Headers
+from txsockjs.factory import SockJSFactory
 import json, time, urllib, urlparse, hashlib, hmac, binascii, random, os, datetime, shutil, zipfile
 
 API_KEY = "RfTll0TPYGVm3kTbauZRH5QVAgBH3UAkQcpPmHDIMaWEa9xtY8"
@@ -35,6 +36,7 @@ def generate_page(post, title, body):
     return safe_format("""<!doctype html>
 <html>
     <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
         <title>Tumblr Backup</title>
     </head>
     <body>
@@ -314,8 +316,6 @@ class TumblrUser(Protocol):
         if self.channel:
             return
         data = json.loads(line.strip())
-        data["public"] = CONSUMER_KEY
-        data["secret"] = CONSUMER_SECRET
         json_only = "json" in data and data["json"]
         self.channel = None
         if "blog" in data:
@@ -383,5 +383,7 @@ class TumblrServer(Factory):
             for p in self.channels[channel]:
                 p.messageReceived(message)
 
-reactor.listenTCP(8080, TumblrServer())
+tumblr = TumblrServer()
+reactor.listenTCP(8081, tumblr)
+reactor.listenTCP(8080, SockJSFactory(tumblr))
 reactor.run()
