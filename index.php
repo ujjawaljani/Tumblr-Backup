@@ -61,6 +61,10 @@
                 <a href="https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=63WAHWQYH6LGY&lc=US&item_name=Tumblr%20Backup%20Support&item_number=TUMBLRBACKUP&currency_code=USD&bn=PP%2dDonationsBF%3abtn_donate_LG%2egif%3aNonHosted">
                 Enjoy this service? A few dollars goes a long way to alleviating server costs!
                 </a>
+                <br><br>
+                <a href="https://github.com/Fugiman/Tumblr-Backup/">
+                Source Code
+                </a>
             </span>
         </div>
         <script>
