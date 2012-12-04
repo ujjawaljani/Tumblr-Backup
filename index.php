@@ -50,7 +50,7 @@
                 - Individual post archive<br>
                 - Archiving photos embedded in text posts<br>
                 - Archiving audio from audio posts<br>
-                <span class="strike">- Archiving video from video posts (only Tumblr & Youtube videos)</span> Temporarily disabled<br>
+                - Archiving video from video posts (only Tumblr & Youtube videos)<br>
                 <br>
                 <b>Planned features include:</b>
                 <br>

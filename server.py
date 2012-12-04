@@ -49,6 +49,9 @@ def generate_page(post, title, body):
     </body>
 </html>""", title, body)
 
+def url2file(url):
+    return hashlib.sha256(url.replace("/","|").replace(" ","-")).hexdigest()
+
 class TumblrDeliverer(Protocol):
     def __init__(self, parent, callback, json, url):
         self.parent = parent
@@ -67,7 +70,7 @@ class TumblrDeliverer(Protocol):
         reason.trap(ResponseDone, PotentialDataLoss)
         data = json.loads(self.buf)["response"] if self.json else self.buf
         if not self.json and data:
-            with open("/mnt/cache/"+self.url.replace("/","|").replace(" ","-"), "wb") as f:
+            with open("/mnt/cache/"+url2file(self.url), "wb") as f:
                 f.write(data)
         self.callback(data)
 
@@ -110,8 +113,8 @@ class TumblrDownloader(object):
             url = safe_format("http://api.tumblr.com/v2/blog/{}/{}", self.url, suffix)
             url += "&api_key="+API_KEY if "?" in url else "?api_key="+API_KEY
         
-        if raw and os.path.exists("/mnt/cache/"+url.replace("/","|").replace(" ","-")):
-            with open("/mnt/cache/"+url.replace("/","|").replace(" ","-"),"rb") as f:
+        if raw and os.path.exists("/mnt/cache/"+url2file(url)):
+            with open("/mnt/cache/"+url2file(url),"rb") as f:
                 callback(f.read())
             return
         
@@ -327,9 +330,6 @@ class TumblrDownloader(object):
             return
         type, chaff, param = self.video_queue[self.video].partition(":")
         method = getattr(self, safe_format("download_videos_{}", type), None)
-        # === DISABLE VIDEO DOWNLOADING FOR NOW ===
-        method = None
-        # === DISABLE VIDEO DOWNLOADING FOR NOW ===
         if method is None:
             del self.videos[self.video_queue[self.video]]
             self.video += 1
@@ -380,8 +380,18 @@ class TumblrDownloader(object):
             data = html[begin+18:end+1]
             params = json.loads(data)
             streams = urlparse.parse_qs(params["args"]["url_encoded_fmt_stream_map"])
-            url = safe_format("{}&signature={}", streams["url"][0], streams["sig"][0])
-            self.videos[self.video_queue[self.video]]["original"] = url
+            index = -1
+            for i in range(len(streams["url"])):
+                quality = streams["quality"][i].split(",")[0]
+                type = streams["type"][i].split(";")[0].split("/")[1]
+                if type == "mp4" and quality in ("hd720","large","medium","small"):
+                    index = i
+                    break
+            url = safe_format("{}&signature={}", streams["url"][index], streams["sig"][index])
+            if index > 0:
+                self.videos[self.video_queue[self.video]]["original"] = "youtube.mp4"
+            else:
+                self.videos[self.video_queue[self.video]]["original"] = "youtube.flv"
             self._request(url, self.video_data, True)
     
     def video_data(self, video):
