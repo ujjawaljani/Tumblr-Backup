@@ -2,6 +2,7 @@
 <html>
     <head>
         <title>Tumblr Backup :: Beta</title>
+        <script src="//ajax.googleapis.com/ajax/libs/jquery/1.8.3/jquery.min.js"></script>
         <script src="http://cdn.sockjs.org/sockjs-0.3.min.js"></script>
         <style>
             #header {
@@ -33,7 +34,13 @@
             <span id="message"></span>
             <a id="archive" href="#"><br>Download your backup here!</a>
             <span id="prompt">Enter your blog name below to begin the archive process</span><br>
-            <form id="blog-form"><input type="text" id="blog"><input type="submit" value="Archive"></form>
+            <form id="blog-form">
+                <input type="text" id="blog"><input type="submit" value="Archive"><br>
+                <span>Backup: </span>
+                <label for="images">Images</label><input type="checkbox" id="images" checked>
+                <label for="audio">Audio</label><input type="checkbox" id="audio" checked>
+                <label for="video">Video</label><input type="checkbox" id="video">
+            </form>
             <a id="already-done" href="/archives">Or browse the already archived tumblrs!</a>
             <a id="ongoing" href="#"><br>Or view all archives in progress!</a>
         </div>
@@ -68,65 +75,67 @@
             </span>
         </div>
         <script>
-            document.getElementById("blog-form").onsubmit = function() {
-                document.getElementById("prompt").style.display = "none";
-                document.getElementById("blog-form").style.display = "none";
-                document.getElementById("already-done").style.display = "none";
-                document.getElementById("ongoing").style.display = "none";
+            $("#blog-form").submit(function() {
+                $("#prompt").hide();
+                $("#blog-form").hide();
+                $("#already-done").hide();
+                $("#ongoing").hide();
                 var conn = new SockJS("http://tumblr-backup.fugiman.com:8080/");
                 var done = false;
                 conn.onopen  = function() {
-                    document.getElementById("message").innerHTML = "Connected to archival server";
-                    document.getElementById("main").style.background = "#BCE8F1";
-                    conn.send(JSON.stringify({"blog":document.getElementById("blog").value}));
+                    $("#message").text("Connected to archival server");
+                    $("#main").css("background", "#BCE8F1");
+                    conn.send(JSON.stringify({
+                        "blog": $("#blog").val(),
+                        "images": $("#images").is(':checked'),
+                        "audio": $("#audio").is(':checked'),
+                        "video": $("#video").is(':checked')
+                    }));
                 }
                 conn.onmessage = function(e) { 
                     var data = JSON.parse(e.data);
                     if(data.message) {
-                        document.getElementById("message").innerHTML = data.message;
+                        $("#message").text(data.message);
                     }
                     if(data.archive) {
                         done = true;
-                        document.getElementById("archive").href = data.archive;
-                        document.getElementById("archive").style.display = "inline";
-                        document.getElementById("main").style.background = "#D6E9C6";
+                        $("#archive").attr("href", data.archive).show();
+                        $("#main").css("background", "#D6E9C6");
                     }
                 }
                 conn.onclose  = function() {
                     if(!done) {
-                        document.getElementById("message").innerHTML = "Connection to archival server lost!";
-                        document.getElementById("main").style.background = "#EED3D7";
+                        $("#message").text("Connection to archival server lost!");
+                        $("#main").css("background", "#EED3D7");
                     }
                 }
                 return false;
-            };
-            document.getElementById("ongoing").onclick = function() {
-                var main = document.getElementById("main");
+            });
+            $("#ongoing").click(function() {
                 var blogs = {};
                 var timer = null;
-                main.innerHTML = "";
+                $("#main").html("");
                 var conn = new SockJS("http://tumblr-backup.fugiman.com:8080/");
                 conn.onopen  = function() {
-                    main.style.background = "#BCE8F1";
+                    $("#main").css("background", "#BCE8F1");
                     conn.send(JSON.stringify({"show_all":true}));
                     timer = setInterval(function() { conn.send(JSON.stringify({"show_all":true})); }, 60000);
                 }
                 conn.onmessage = function(e) { 
                     var data = JSON.parse(e.data);
                     if(!(data.blog in blogs)) {
-                        blogs[data.blog] = document.createElement("p");
-                        main.appendChild(blogs[data.blog]);
+                        blogs[data.blog] = $("<p></p>");
+                        $("#main").append(blogs[data.blog]);
                     }
-                    blogs[data.blog].innerHTML = data.blog + ": " + data.message;
+                    blogs[data.blog].text(data.blog + ": " + data.message);
                 }
                 conn.onclose  = function() {
-                    main.innerHTML = "Connection to archival server lost!";
-                    main.style.background = "#EED3D7";
+                    $("#main").css("background", "#EED3D7").text("Connection to archival server lost!");
                     if(timer)
                         clearInterval(timer);
                 }
                 return false;
-            };
+            });
         </script>
     </body>
 </html>
