@@ -6,7 +6,9 @@ from twisted.internet.error import ProcessTerminated
 from twisted.web.client import HTTPConnectionPool, Agent, ResponseDone
 from twisted.web.http import PotentialDataLoss
 from twisted.web.http_headers import Headers
-from txsockjs.factory import SockJSFactory
+from twisted.web.static import File
+from txsockjs.factory import SockJSResource
+from klein import resource, route
 import json, time, urllib, urlparse, hashlib, hmac, binascii, random, os, datetime, shutil, zipfile, re, locale, base64
 
 API_KEY = "RfTll0TPYGVm3kTbauZRH5QVAgBH3UAkQcpPmHDIMaWEa9xtY8"
@@ -15,7 +17,6 @@ ALLOWED_AUDIO_EXTENSIONS = ("mp3","ogg")
 ALLOWED_VIDEO_EXTENSIONS = ("mp4","flv")
 
 locale.setlocale(locale.LC_ALL, '')
-
 
 def normalize(s, encoding):
     if not isinstance(s, basestring):
@@ -93,31 +94,19 @@ class TumblrDeliverer(Protocol):
             data = [] if self.json else ""
         else:
             data = json.loads(self.buf)["response"] if self.json else self.buf
-            if not self.json and data:
-                with open("/mnt/cache/"+url2file(self.url), "wb") as f:
-                    f.write(data)
         self.callback(data)
 
 class TumblrDownloader(object):
-    def __init__(self, factory, url, images, audio, video):
+    def __init__(self, factory, url):
         self.factory = factory
         self.url = url
-        self.dl_images = images;
-        self.dl_audio = audio;
-        self.dl_video = video;
         self.blog = None
         self.status = ""
         self.finished = Deferred()
         self.posts = []
         self.images = {}
-        self.audios = {}
-        self.videos = {}
         self.image_queue = []
-        self.audio_queue = []
-        self.video_queue = []
         self.image = 0
-        self.audio = 0
-        self.video = 0
         self.folder = safe_format("/mnt/tmp/{}", self.url)
         os.mkdir(self.folder)
         self._request("info", self.blog_info)
@@ -133,11 +122,6 @@ class TumblrDownloader(object):
         else:
             url = safe_format("http://api.tumblr.com/v2/blog/{}/{}", self.url, suffix)
             url += "&api_key="+API_KEY if "?" in url else "?api_key="+API_KEY
-        
-        if raw and os.path.exists("/mnt/cache/"+url2file(url)):
-            with open("/mnt/cache/"+url2file(url),"rb") as f:
-                callback(f.read())
-            return
         
         d = Agent(reactor, pool=self.factory.pool).request("GET", url, None, None)
         d.addCallback(self._deliver, callback, not raw, url)
@@ -198,11 +182,9 @@ class TumblrDownloader(object):
                         width = player["width"]
                         embed = player["embed_code"]
                 post["_embed"] = embed
-                post["_video"] = self._extract_video(embed, timestamp)
                 self._extract_images(post["caption"], timestamp)
             elif post["type"] == "audio":
                 embed = post["player"]
-                post["_audio"] = self._extract_audio(embed, timestamp)
                 self._extract_images(post["caption"].encode("UTF-8") if "caption" in post else "", timestamp)
             elif post["type"] == "photo":
                 embed = ""
@@ -230,11 +212,7 @@ class TumblrDownloader(object):
             with open(safe_format("{}/posts.json", self.folder), "w") as f:
                 f.write(json.dumps(self.posts))
             os.makedirs(safe_format("{}/images/", self.folder))
-            os.makedirs(safe_format("{}/audio/", self.folder))
-            os.makedirs(safe_format("{}/video/", self.folder))
             self.image_queue = [x[0] for x in sorted(sorted(self.images.items(), key=lambda x: x[1]["index"]), key=lambda x: x[1]["time"])]
-            self.audio_queue = [x[0] for x in sorted(sorted(self.audios.items(), key=lambda x: x[1]["index"]), key=lambda x: x[1]["time"])]
-            self.video_queue = [x[0] for x in sorted(sorted(self.videos.items(), key=lambda x: x[1]["index"]), key=lambda x: x[1]["time"])]
             reactor.callLater(0, self.download_images)
         else:
             reactor.callLater(0, self.download_posts)
@@ -246,8 +224,6 @@ class TumblrDownloader(object):
         return safe_format("<img{}src='{}'{}>", match.group(1), url, match.group(3))
     
     def _extract_images(self, body, time):
-        if not self.dl_images:
-            return None
         matches = re.findall('<img([^>]*)src="([^"]*)"([^>]*)>', body, re.I)
         for match in matches:
             url = match[1]
@@ -258,46 +234,11 @@ class TumblrDownloader(object):
                 "file": url
             }
     
-    def _extract_audio(self, body, time):
-        if not self.dl_audio:
-            return None
-        match = re.search('audio_file=([^&]*)&', body, re.I)
-        if match is None:
-            return None
-        url = match.group(1)
-        self.audios[url] = {
-            "index": len(self.audios.keys()),
-            "time": time,
-            "original": url,
-            "file": url
-        }
-        return url
-    
-    def _extract_video(self, body, time):
-        if not self.dl_video:
-            return None
-        match = re.search('<iframe([^>]*)src="([^"]*)"([^>]*)>', body, re.I)
-        if match is None:
-            return None
-        url = urlparse.urlparse(match.group(2))
-        if "tumblr" in url.hostname: # Tumblr
-            url = safe_format("tumblr:{}", url.path)
-        elif "youtube" in url.hostname: # Youtube
-            id = url.path.strip("/").split("/")[1]
-            url = safe_format("yt:{}", id)
-        else:
-            return None
-        self.videos[url] = {
-            "index": len(self.videos.keys()),
-            "time": time,
-            "original": url,
-            "file": url
-        }
-        return url
-    
     def download_images(self):
         if self.image >= len(self.image_queue):
-            return self.download_audios()
+            reactor.callLater(0, self.parse_posts)
+            self.publish("Parsing Posts")
+            return
         url = self.image_queue[self.image].encode("UTF-8")
         scheme = urlparse.urlparse(url, "http").scheme
         if scheme in ("http","https"):
@@ -331,129 +272,6 @@ class TumblrDownloader(object):
         self.image += 1
         reactor.callLater(0, self.download_images)
     
-    def download_audios(self):
-        if self.audio >= len(self.audio_queue):
-            return self.download_videos()
-        url = safe_format("{}?plead=please-dont-download-this-or-our-lawyers-wont-let-us-host-audio", self.audio_queue[self.audio])
-        d = Agent(reactor, pool=self.factory.pool).request("HEAD", url, None, None)
-        d.addCallback(self.audio_info)
-        d.addErrback(self._error, self.audio_info, False)
-        self.publish(safe_format("Fetching Audio ({!s}/{!s})", self.audio+1, len(self.audio_queue)))
-    
-    def audio_info(self, response):
-        if response:
-            url = response.headers.getRawHeaders("Location")[0]
-            self.audios[self.audio_queue[self.audio]]["original"] = url
-            self._request(url, self.audio_data, True)
-        else:
-            del self.audios[self.audio_queue[self.audio]]
-            self.audio += 1
-            reactor.callLater(0, self.download_audios)
-    
-    def audio_data(self, audio):
-        suffix = self.audios[self.audio_queue[self.audio]]["original"].split(".")[-1].lower()
-        if suffix not in ALLOWED_AUDIO_EXTENSIONS:
-            suffix = "mp3"
-        self.audios[self.audio_queue[self.audio]]["file"] = safe_format("audio/audio{:>06d}.{}", self.audio+1, suffix)
-        with open(safe_format("{}/{}", self.folder, self.audios[self.audio_queue[self.audio]]["file"]), "wb") as f:
-            f.write(audio)
-        self.audio += 1
-        reactor.callLater(0, self.download_audios)
-    
-    def download_videos(self):
-        if self.video >= len(self.video_queue):
-            reactor.callLater(0, self.parse_posts)
-            self.publish("Parsing Posts")
-            return
-        type, chaff, param = self.video_queue[self.video].partition(":")
-        method = getattr(self, safe_format("download_videos_{}", type), None)
-        if method is None:
-            del self.videos[self.video_queue[self.video]]
-            self.video += 1
-            self.download_videos()
-        else:
-            method(param)
-            self.publish(safe_format("Fetching Video ({!s}/{!s})", self.video+1, len(self.video_queue)))
-    
-    def video_fail(self, chaff):
-        del self.videos[self.video_queue[self.video]]
-        self.video += 1
-        self.download_videos()
-    
-    def download_videos_tumblr(self, path):
-        url = safe_format("http://www.tumblr.com{}", path)
-        self._request(url.encode("UTF-8"), self.video_tumblr_embed, True)
-    
-    def video_tumblr_embed(self, html):
-        match = re.search('<source([^>]*)src="([^"]*)"([^>]*)>', html, re.I)
-        if match is None:
-            del self.videos[self.video_queue[self.video]]
-            self.video += 1
-            self.download_videos()
-        else:
-            url = match.group(2)
-            d = Agent(reactor, pool=self.factory.pool).request("HEAD", url, None, None)
-            d.addCallback(self.video_tumblr_info)
-            d.addErrback(self._error, self.video_fail, False)
-    
-    def video_tumblr_info(self, response):
-        url = response.headers.getRawHeaders("Location")[0]
-        self.videos[self.video_queue[self.video]]["original"] = url
-        self._request(url, self.video_data, True)
-    
-    def download_videos_yt(self, id):
-        url = safe_format("http://www.youtube.com/watch?v={}", id)
-        self._request(url.encode("UTF-8"), self.video_yt_info, True)
-    
-    def video_yt_info(self, html):
-        begin = html.find("yt.playerConfig = {")
-        if begin < 0:
-            del self.videos[self.video_queue[self.video]]
-            if html.find("This video is unavailable") < 0:
-                print "Error downloading video #"+str(self.video)
-                with open("/mnt/tmp/tumblr_server_error.log","a") as f:
-                    blogstr = "===== BLOG: "+self.url+" ====="
-                    videostr = "===== VIDEO: "+self.video_queue[self.video]+" ====="
-                    spacer = "="*max(len(blogstr), len(videostr))
-                    f.write(safe_format("\n\n{}\n{}\n{}\n{}\n\n{}", spacer, blogstr, videostr, spacer, html))
-            self.video += 1
-            self.download_videos()
-        else:
-            end = html.find("};", begin)
-            data = html[begin+18:end+1]
-            params = json.loads(data)
-            streams = urlparse.parse_qs(params["args"]["url_encoded_fmt_stream_map"])
-            index = -1
-            for i in range(len(streams["url"])):
-                quality = streams["quality"][i].split(",")[0]
-                type = streams["type"][i].split(";")[0].split("/")[1]
-                if type == "mp4" and quality in ("hd720","large","medium","small"):
-                    index = i
-                    break
-            try:
-                url = safe_format("{}&signature={}", streams["url"][index], streams["sig"][index])
-            except:
-                print "Error building youtube url: "+repr(streams)
-                del self.videos[self.video_queue[self.video]]
-                self.video += 1
-                self.download_videos()
-                return
-            if index >= 0:
-                self.videos[self.video_queue[self.video]]["original"] = "youtube.mp4"
-            else:
-                self.videos[self.video_queue[self.video]]["original"] = "youtube.flv"
-            self._request(url, self.video_data, True)
-    
-    def video_data(self, video):
-        suffix = self.videos[self.video_queue[self.video]]["original"].split(".")[-1].lower()
-        if suffix not in ALLOWED_VIDEO_EXTENSIONS:
-            suffix = "mp4"
-        self.videos[self.video_queue[self.video]]["file"] = safe_format("video/video{:>06d}.{}", self.video+1, suffix)
-        with open(safe_format("{}/{}", self.folder, self.videos[self.video_queue[self.video]]["file"]), "wb") as f:
-            f.write(video)
-        self.video += 1
-        reactor.callLater(0, self.download_videos)
-    
     def parse_posts(self):
         for number, post in enumerate(self.posts):
             timestamp = datetime.datetime.fromtimestamp(post["timestamp"])
@@ -476,17 +294,11 @@ class TumblrDownloader(object):
                 answer = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self._patch_images, post["answer"].encode("UTF-8"))
                 data = generate_page(post, safe_format("<blockquote><p>{}</p><small><a href='{}'>{}</a></small></blockquote>", post["question"],post["asking_url"],post["asking_name"]), answer)
             elif post["type"] == "video":
-                if post["_video"] in self.videos:
-                    embed = safe_format("<video src='../{}' controls><a href='../{}'>Watch video</a></video>", self.videos[post["_video"]]["file"], self.videos[post["_video"]]["file"])
-                else:
-                    embed = post["_embed"]
+                embed = post["_embed"]
                 caption = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self._patch_images, post["caption"].encode("UTF-8"))
                 data = generate_page(post, embed, caption)
             elif post["type"] == "audio":
-                if post["_audio"] in self.audios:
-                    embed = safe_format("<audio src='../{}' controls><a href='../{}'>Listen to audio</a></audio>", self.audios[post["_audio"]]["file"], self.audios[post["_audio"]]["file"])
-                else:
-                    embed = post["player"]
+                embed = post["player"]
                 caption = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self._patch_images, post["caption"].encode("UTF-8") if "caption" in post else "")
                 title = safe_format("<h1>{} by {}</h1>", 
                     post["track_name"] if "track_name" in post else "",
@@ -549,7 +361,7 @@ class TumblrUser(Protocol):
             url = urlparse.urlparse(url).hostname
             print url
             self.channel = url
-            self.factory.download(url, self, data["images"], data["audio"], data["video"])
+            self.factory.download(url, self)
             self.factory.subscribe(self, self.channel)
         elif "show_all" in data and data["show_all"]:
             if self.channels:
@@ -592,9 +404,9 @@ class TumblrServer(Factory):
         self.channels = {}
         self.downloads = {}
     
-    def download(self, url, p, images, audio, video):
+    def download(self, url, p):
         if url not in self.downloads:
-            self.downloads[url] = TumblrDownloader(self, url, images, audio, video)
+            self.downloads[url] = TumblrDownloader(self, url)
             self.downloads[url].finished.addCallback(self.done)
         else:
             p.messageReceived(url, self.downloads[url].status)
@@ -624,6 +436,18 @@ class TumblrServer(Factory):
 # Start the party
 shutil.rmtree("/mnt/tmp")
 os.mkdir("/mnt/tmp")
-tumblr = TumblrServer()
-reactor.listenTCP(8080, SockJSFactory(tumblr))
-reactor.run()
+index_page = File("index.html")
+sockjs_server = SockJSResource(TumblrServer())
+
+from functools import partial
+def bypass(self, path, request):
+    return self
+index_page.getChild = partial(bypass, index_page)
+
+@route('/')
+def index(request):
+    return index_page
+
+@route('/sockjs/', branch=True)
+def sockjs(request):
+    return sockjs_server

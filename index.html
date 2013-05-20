@@ -29,19 +29,14 @@
         </style>
     </head>
     <body>
-        <div id="header"><h1>Tumblr Backup</h1><h3>Beta</h3></div>
+        <div id="header"><h1>Tumblr Backup</h1></div>
         <div id="main">
             <span id="message"></span>
             <a id="archive" href="#"><br>Download your backup here!</a>
             <span id="prompt">Enter your blog name below to begin the archive process</span><br>
             <form id="blog-form">
-                <input type="text" id="blog"><input type="submit" value="Archive"><br>
-                <span>Backup: </span>
-                <label for="images">Images</label><input type="checkbox" id="images" checked>
-                <label for="audio">Audio</label><input type="checkbox" id="audio" checked>
-                <label for="video">Video</label><input type="checkbox" id="video">
+                <input type="text" id="blog"><input type="submit" value="Archive">
             </form>
-            <a id="already-done" href="/archives">Or browse the already archived tumblrs!</a>
             <a id="ongoing" href="#"><br>Or view all archives in progress!</a>
         </div>
         <div id="footer">
@@ -49,21 +44,13 @@
                 As an beta version, this script may contain bugs.
                 Feel free to <a href="http://fugiman.tumblr.com/ask">send me an ask</a> if you need help or have any ideas (or if you found this useful!).
                 If you leave the page, or otherwise disconnect from the archive server, the script will still backup your blog.
-                You can <a href="/archives">view archived blogs here</a>, or refresh the page and re-enter your blog name to reconnect to archival server.
+                You can refresh the page and re-enter your blog name to reconnect to archival server.
                 <br><br>
                 <b>Current features include:</b>
                 <br>
                 - Raw JSON archive<br>
                 - Individual post archive<br>
                 - Archiving photos embedded in text posts<br>
-                - Archiving audio from audio posts<br>
-                - Archiving video from video posts (only Tumblr & Youtube videos)<br>
-                <br>
-                <b>Planned features include:</b>
-                <br>
-                - Better theming of archived posts<br>
-                - Index page<br>
-                - Archiving video from more sources<br>
                 <br><br>
                 <a href="https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=63WAHWQYH6LGY&lc=US&item_name=Tumblr%20Backup%20Support&item_number=TUMBLRBACKUP&currency_code=USD&bn=PP%2dDonationsBF%3abtn_donate_LG%2egif%3aNonHosted">
                 Enjoy this service? A few dollars goes a long way to alleviating server costs!
@@ -80,17 +67,12 @@
                 $("#blog-form").hide();
                 $("#already-done").hide();
                 $("#ongoing").hide();
-                var conn = new SockJS("http://tumblr-backup.fugiman.com:8080/");
+                var conn = new SockJS("http://tumblr-backup.fugiman.com/sockjs/");
                 var done = false;
                 conn.onopen  = function() {
                     $("#message").text("Connected to archival server");
                     $("#main").css("background", "#BCE8F1");
-                    conn.send(JSON.stringify({
-                        "blog": $("#blog").val(),
-                        "images": $("#images").is(':checked'),
-                        "audio": $("#audio").is(':checked'),
-                        "video": $("#video").is(':checked')
-                    }));
+                    conn.send(JSON.stringify({"blog": $("#blog").val()}));
                 }
                 conn.onmessage = function(e) { 
                     var data = JSON.parse(e.data);
@@ -115,7 +97,7 @@
                 var blogs = {};
                 var timer = null;
                 $("#main").html("");
-                var conn = new SockJS("http://tumblr-backup.fugiman.com:8080/");
+                var conn = new SockJS("http://tumblr-backup.fugiman.com/sockjs/");
                 conn.onopen  = function() {
                     $("#main").css("background", "#BCE8F1");
                     conn.send(JSON.stringify({"show_all":true}));
