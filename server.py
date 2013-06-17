@@ -1,22 +1,22 @@
 # -*- coding: utf-8 -*-
 from twisted.internet import reactor
-from twisted.internet.defer import Deferred
+from twisted.internet.defer import Deferred, inlineCallbacks, returnValue
 from twisted.internet.protocol import Protocol, ProcessProtocol, Factory
 from twisted.internet.error import ProcessTerminated
+from twisted.internet.utils import getProcessValue
+from twisted.python import log
 from twisted.web.client import HTTPConnectionPool, Agent, ResponseDone
 from twisted.web.http import PotentialDataLoss
 from twisted.web.http_headers import Headers
 from twisted.web.static import File
 from txsockjs.factory import SockJSResource
-from klein import resource, route
-import json, time, urllib, urlparse, hashlib, hmac, binascii, random, os, datetime, shutil, zipfile, re, locale, base64
+from StringIO import StringIO
+import json, time, urllib, urlparse, hashlib, hmac, binascii, random, os, datetime, shutil, zipfile, re, locale, base64, stat
 
 API_KEY = "RfTll0TPYGVm3kTbauZRH5QVAgBH3UAkQcpPmHDIMaWEa9xtY8"
 ALLOWED_IMAGE_EXTENSIONS = ("png","jpg","gif","bmp")
 ALLOWED_AUDIO_EXTENSIONS = ("mp3","ogg")
 ALLOWED_VIDEO_EXTENSIONS = ("mp4","flv")
-
-locale.setlocale(locale.LC_ALL, '')
 
 def normalize(s, encoding):
     if not isinstance(s, basestring):
@@ -51,179 +51,160 @@ def generate_page(post, title, body):
     </body>
 </html>""", title, body)
 
-def url2file(url):
-    return hashlib.sha256(url.replace("/","|").replace(" ","-")).hexdigest()
-
-class TumblrProcess(ProcessProtocol):
-    def __init__(self, parent, callback):
-        self.parent = parent
-        self.callback = callback
-        self.percentage = ""
-    
-    def outReceived(self, data):
-        index = data.rfind("%")
-        if index >= 0:
-            percentage = data[index-3:index+1].strip()
-            if percentage != self.percentage:
-                self.percentage = percentage
-                self.parent.factory.publish(self.parent.url, self.parent.status + " [" + self.percentage + "]")
-    
-    def processEnded(self, status=None):
-        if status and status.check(ProcessTerminated) is not None:
-            status.printTraceback()
-        else:
-            self.callback()
-
 class TumblrDeliverer(Protocol):
-    def __init__(self, parent, callback, json, url):
+    def __init__(self, parent, filename = None):
         self.parent = parent
-        self.callback = callback
-        self.json = json
-        self.url = url
-        self.buf = "";
+        self.file = StringIO() if filename is None else open(filename, "wb")
+        self.json = filename is None
+        self.len = 0
+        self.result = Deferred()
     
     def dataReceived(self, data):
-        self.buf += data
-        kb = len(self.buf)/1024
-        if(kb > 149): # Minimum of 150KB to display. Saves flashing messages during downloading of post info or small images
-            self.parent.factory.publish(self.parent.url, self.parent.status + " [" + locale.format("%d", kb, grouping=True) + " KB]")
+        self.file.write(data)
+        self.len += len(data)
+        if(self.len > 150*1024): # Minimum of 150KB to display. Saves flashing messages during downloading of post info or small images
+            self.parent.factory.publish(self.parent.url, "{} [{:,d} KB]".format(self.parent.status, self.len / 1024))
     
     def connectionLost(self, reason):
         if reason.check(ResponseDone, PotentialDataLoss) is None: # Failed
             reason.printTraceback()
-            data = [] if self.json else ""
+            data = []
         else:
-            data = json.loads(self.buf)["response"] if self.json else self.buf
-        self.callback(data)
+            data = json.loads(self.file.getvalue())["response"] if self.json else []
+
+        self.file.close()
+        self.result.callback(data)
 
 class TumblrDownloader(object):
     def __init__(self, factory, url):
         self.factory = factory
         self.url = url
-        self.blog = None
+
         self.status = ""
+        self.errored = False
         self.finished = Deferred()
+
+        self.blog = None
         self.posts = []
         self.images = {}
         self.image_queue = []
-        self.image = 0
-        self.folder = safe_format("/mnt/tmp/{}", self.url)
+
+        self.folder = safe_format("./tmp/{}", self.url)
         os.mkdir(self.folder)
-        self._request("info", self.blog_info)
-        self.publish("Fetching Blog Info")
+        self.blog_info()
     
-    def publish(self, message):
+    def publish(self, message, error=False):
         self.status = message
-        self.factory.publish(self.url, message)
+        self.errored = error
+        self.factory.publish(self.url, message, error)
     
-    def _request(self, suffix, callback, raw=False):
-        if raw:
-            url = suffix
-        else:
-            url = safe_format("http://api.tumblr.com/v2/blog/{}/{}", self.url, suffix)
+    @inlineCallbacks
+    def request(self, url, filename=None):
+        if filename is None:
+            url = safe_format("http://api.tumblr.com/v2/blog/{}/{}", self.url, url)
             url += "&api_key="+API_KEY if "?" in url else "?api_key="+API_KEY
         
-        d = Agent(reactor, pool=self.factory.pool).request("GET", url, None, None)
-        d.addCallback(self._deliver, callback, not raw, url)
-        d.addErrback(self._error, callback, not raw)
-    
-    def _error(self, failure, callback, json):
-        failure.printTraceback()
-        callback([] if json else "")
-    
-    def _deliver(self, response, callback, json, url):
-        response.deliverBody(TumblrDeliverer(self, callback, json, url))
-    
-    def blog_info(self, info):
-        if info:
-            self.blog = info["blog"]
-            self._request("avatar/512", self.avatar_info)
-            self.publish("Fetching Avatar URL")
+        try:
+            response = yield Agent(reactor, pool=self.factory.pool).request("GET", url, None, None)
+        except Exception as e:
+            log.err("Failed to fetch page: {}".format(url))
+            returnValue([])
         else:
-            self.publish("Not a valid blog. Aborting.")
+            deliverer = TumblrDeliverer(self, filename)
+            response.deliverBody(deliverer)
+            result = yield deliverer.result
+            returnValue(result)
+    
+    @inlineCallbacks
+    def blog_info(self):
+        self.publish("Fetching Blog Info")
+        info = yield self.request("info")
+        if info:
+            if info["blog"]["posts"] > 20000:
+                self.publish("Archives limited to 20,000 posts for now. Send Fugi an ask to inquire about an exception.", True)
+                shutil.rmtree(self.folder)
+            else:
+                self.blog = info["blog"]
+                self.avatar_info()
+        else:
+            self.publish("Not a valid blog. Aborting.", True)
             shutil.rmtree(self.folder)
     
-    def avatar_info(self, info):
+    @inlineCallbacks
+    def avatar_info(self):
+        self.publish("Fetching Avatar URL")
+        info = yield self.request("avatar/512")
         self.blog["avatar_url"] = info["avatar_url"]
-        self._request(self.blog["avatar_url"].encode("UTF-8"), self.avatar, True)
+
         self.publish("Fetching Avatar")
-    
-    def avatar(self, avatar):
         suffix = self.blog["avatar_url"].split(".")[-1].lower().replace("jpeg","jpg")
-        with open(safe_format("{}/avatar.{}", self.folder, suffix), "wb") as f:
-            f.write(avatar)
+        yield self.request(self.blog["avatar_url"].encode("UTF-8"), os.path.join(self.folder, safe_format("avatar.{}", suffix)))
         self.download_posts()
     
+    @inlineCallbacks
     def download_posts(self):
-        post = len(self.posts)
-        self._request(safe_format("posts?offset={!s}", post), self.post_data)
-        self.publish(safe_format("Fetching Posts ({!s}/{!s})", post, self.blog["posts"]))
+        for offset in range(0, self.blog["posts"], 20):
+            self.publish(safe_format("Fetching Posts ({:d}/{:d})", offset, self.blog["posts"]))
+            result = yield self.request(safe_format("posts?offset={:d}", offset))
+            posts = result["posts"]
+            self.posts.extend(posts)
+            for post in posts:
+                self.parse_post(post)
+
+        with open(safe_format("{}/posts.json", self.folder), "w") as f:
+            f.write(json.dumps(self.posts))
+        os.makedirs(safe_format("{}/images/", self.folder))
+        self.image_queue = [x[0] for x in sorted(sorted(self.images.items(), key=lambda x: x[1]["index"]), key=lambda x: x[1]["time"])]
+        self.download_images()
     
-    def post_data(self, posts):
-        posts = posts["posts"]
-        self.posts.extend(posts)
-        for post in posts:
-            timestamp = datetime.datetime.fromtimestamp(post["timestamp"])
-            
-            if post["type"] == "text":
-                self._extract_images(post["body"], timestamp)
-            elif post["type"] == "quote":
-                self._extract_images(post["text"], timestamp)
-                self._extract_images(post["source"], timestamp)
-            elif post["type"] == "link":
-                self._extract_images(post["description"], timestamp)
-            elif post["type"] == "answer":
-                self._extract_images(post["answer"], timestamp)
-            elif post["type"] == "video":
-                embed = ""
+    def parse_post(self, post):
+        timestamp = datetime.datetime.fromtimestamp(post["timestamp"])
+        
+        if post["type"] == "text":
+            self.extract_images(post["body"], timestamp)
+        elif post["type"] == "quote":
+            self.extract_images(post["text"], timestamp)
+            self.extract_images(post["source"], timestamp)
+        elif post["type"] == "link":
+            self.extract_images(post["description"], timestamp)
+        elif post["type"] == "answer":
+            self.extract_images(post["answer"], timestamp)
+        elif post["type"] == "video":
+            embed = ""
+            width = 0
+            for player in post["player"]:
+                if player["width"] > width:
+                    width = player["width"]
+                    embed = player["embed_code"]
+            post["_embed"] = embed
+            self.extract_images(post["caption"], timestamp)
+        elif post["type"] == "audio":
+            embed = post["player"]
+            self.extract_images(post["caption"].encode("UTF-8") if "caption" in post else "", timestamp)
+        elif post["type"] == "photo":
+            embed = ""
+            for photo in post["photos"]:
                 width = 0
-                for player in post["player"]:
-                    if player["width"] > width:
-                        width = player["width"]
-                        embed = player["embed_code"]
-                post["_embed"] = embed
-                self._extract_images(post["caption"], timestamp)
-            elif post["type"] == "audio":
-                embed = post["player"]
-                self._extract_images(post["caption"].encode("UTF-8") if "caption" in post else "", timestamp)
-            elif post["type"] == "photo":
-                embed = ""
-                for photo in post["photos"]:
-                    width = 0
-                    url = ""
-                    for size in photo["alt_sizes"]:
-                        if size["width"] > width:
-                            width = size["width"]
-                            url = size["url"]
-                    if url:
-                        photo["_photo"] = url
-                        self.images[url] = {
-                            "index": len(self.images.keys()),
-                            "time": timestamp,
-                            "original": url,
-                            "file": url
-                        }
-                self._extract_images(post["caption"], timestamp)
-            elif post["type"] == "chat":
-                pass
-            else:
-                raise Exception("Invalid type - "+post["type"])
-        if len(self.posts) >= self.blog["posts"]:
-            with open(safe_format("{}/posts.json", self.folder), "w") as f:
-                f.write(json.dumps(self.posts))
-            os.makedirs(safe_format("{}/images/", self.folder))
-            self.image_queue = [x[0] for x in sorted(sorted(self.images.items(), key=lambda x: x[1]["index"]), key=lambda x: x[1]["time"])]
-            reactor.callLater(0, self.download_images)
+                url = ""
+                for size in photo["alt_sizes"]:
+                    if size["width"] > width:
+                        width = size["width"]
+                        url = size["url"]
+                if url:
+                    photo["_photo"] = url
+                    self.images[url] = {
+                        "index": len(self.images.keys()),
+                        "time": timestamp,
+                        "original": url,
+                        "file": url
+                    }
+            self.extract_images(post["caption"], timestamp)
+        elif post["type"] == "chat":
+            pass
         else:
-            reactor.callLater(0, self.download_posts)
+            raise Exception("Invalid type - "+post["type"])
     
-    def _patch_images(self, match):
-        url = match.group(2)
-        if url in self.images:
-            url = safe_format("../{}", self.images[url]["file"])
-        return safe_format("<img{}src='{}'{}>", match.group(1), url, match.group(3))
-    
-    def _extract_images(self, body, time):
+    def extract_images(self, body, time):
         matches = re.findall('<img([^>]*)src="([^"]*)"([^>]*)>', body, re.I)
         for match in matches:
             url = match[1]
@@ -234,45 +215,60 @@ class TumblrDownloader(object):
                 "file": url
             }
     
+    @inlineCallbacks
     def download_images(self):
-        if self.image >= len(self.image_queue):
-            reactor.callLater(0, self.parse_posts)
-            self.publish("Parsing Posts")
-            return
-        url = self.image_queue[self.image].encode("UTF-8")
-        scheme = urlparse.urlparse(url, "http").scheme
-        if scheme in ("http","https"):
-            self._request(url, self.image_data, True)
-        elif scheme in ("data",):
-            try:
-                mime = url[5:url.index(";")].split("/")
-                data = url[1+url.index(","):]
+        images = len(self.image_queue)
+        for index, image in enumerate(self.image_queue):
+            # Calculate free space
+            stats = os.statvfs('/')
+            free_bytes = stats.f_bavail * stats.f_frsize
+            if free_bytes < 1024**3: # 1GB
+                self.publish("Ran out of disk space, try again later.", True)
+                shutil.rmtree(self.folder)
+                return
+
+            self.publish(safe_format("Fetching Images ({:d}/{:d})", index+1, images))
+            url = image.encode("UTF-8")
+            scheme = urlparse.urlparse(url, "http").scheme
+
+            if scheme in ("http","https"):
+                suffix = self.images[image]["original"].split(".")[-1].lower().replace("jpeg","jpg")
+                if suffix not in ALLOWED_IMAGE_EXTENSIONS:
+                    suffix = "png"
+                self.images[image]["file"] = safe_format("images/image{:>06d}.{}", index+1, suffix)
+                filename = safe_format("{}/{}", self.folder, self.images[image]["file"])
+
+                yield self.request(url, filename)
+
+            elif scheme in ("data",):
+                headers = url[5:url.index(",")].split(";")
+                mime = headers[0].split("/")
+                data = urllib.unquote(url[1+url.index(","):])
+
                 if mime[0] != "image":
                     print("WARNING: Non image-type mime - "+mime.join("/"))
-                self.images[self.image_queue[self.image]]["original"] = "data."+mime[1]
-                self.image_data(base64.b64decode(data))
-            except:
-                print safe_format("WTF data uri: {}", url)
-                del self.images[self.image_queue[self.image]]
-                self.image += 1
-                reactor.callLater(0, self.download_images)
-        else:
-            del self.images[self.image_queue[self.image]]
-            self.image += 1
-            reactor.callLater(0, self.download_images)
-        self.publish(safe_format("Fetching Images ({!s}/{!s})", self.image+1, len(self.image_queue)))
-    
-    def image_data(self, image):
-        suffix = self.images[self.image_queue[self.image]]["original"].split(".")[-1].lower().replace("jpeg","jpg")
-        if suffix not in ALLOWED_IMAGE_EXTENSIONS:
-            suffix = "png"
-        self.images[self.image_queue[self.image]]["file"] = safe_format("images/image{:>06d}.{}", self.image+1, suffix)
-        with open(safe_format("{}/{}", self.folder, self.images[self.image_queue[self.image]]["file"]), "wb") as f:
-            f.write(image)
-        self.image += 1
-        reactor.callLater(0, self.download_images)
+
+                self.images[image]["original"] = "data."+mime[1]
+                suffix = self.images[image]["original"].split(".")[-1].lower().replace("jpeg","jpg")
+                if suffix not in ALLOWED_IMAGE_EXTENSIONS:
+                    suffix = "png"
+                self.images[image]["file"] = safe_format("images/image{:>06d}.{}", index+1, suffix)
+                filename = safe_format("{}/{}", self.folder, self.images[image]["file"])
+
+                if "base64" in headers:
+                    data = base64.b64decode(data)
+
+                with open(filename, "wb") as f:
+                    f.write(data)
+
+            else:
+                del self.images[image]
+                continue
+
+        self.parse_posts()
     
     def parse_posts(self):
+        self.publish("Parsing Posts")
         for number, post in enumerate(self.posts):
             timestamp = datetime.datetime.fromtimestamp(post["timestamp"])
             folder = timestamp.strftime("%Y_%m-%B")
@@ -281,25 +277,25 @@ class TumblrDownloader(object):
             
             if post["type"] == "text":
                 title = safe_format("<h1>{}</h1>", post["title"]) if "title" in post and post["title"] else ""
-                body = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self._patch_images, post["body"].encode("UTF-8"))
+                body = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self.patch_images, post["body"].encode("UTF-8"))
                 data = generate_page(post, title, body)
             elif post["type"] == "quote":
-                text = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self._patch_images, post["text"].encode("UTF-8"))
-                source = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self._patch_images, post["source"].encode("UTF-8"))
+                text = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self.patch_images, post["text"].encode("UTF-8"))
+                source = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self.patch_images, post["source"].encode("UTF-8"))
                 data = generate_page(post, "", safe_format("<blockquote><p>{}</p><small>{}</small></blockquote>", text, source))
             elif post["type"] == "link":
-                description = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self._patch_images, post["description"].encode("UTF-8"))
+                description = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self.patch_images, post["description"].encode("UTF-8"))
                 data = generate_page(post, safe_format("<a href='{}'><h1>{}</h1></a>", post["url"],post["title"]), description)
             elif post["type"] == "answer":
-                answer = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self._patch_images, post["answer"].encode("UTF-8"))
+                answer = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self.patch_images, post["answer"].encode("UTF-8"))
                 data = generate_page(post, safe_format("<blockquote><p>{}</p><small><a href='{}'>{}</a></small></blockquote>", post["question"],post["asking_url"],post["asking_name"]), answer)
             elif post["type"] == "video":
                 embed = post["_embed"]
-                caption = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self._patch_images, post["caption"].encode("UTF-8"))
+                caption = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self.patch_images, post["caption"].encode("UTF-8"))
                 data = generate_page(post, embed, caption)
             elif post["type"] == "audio":
                 embed = post["player"]
-                caption = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self._patch_images, post["caption"].encode("UTF-8") if "caption" in post else "")
+                caption = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self.patch_images, post["caption"].encode("UTF-8") if "caption" in post else "")
                 title = safe_format("<h1>{} by {}</h1>", 
                     post["track_name"] if "track_name" in post else "",
                     post["artist"] if "artist" in post else ""
@@ -316,13 +312,16 @@ class TumblrDownloader(object):
                 for photo in post["photos"]:
                     url = photo["_photo"]
                     embed += safe_format("<img src='../{}' alt='{}' />", self.images[url]["file"], photo["caption"])
-                caption = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self._patch_images, post["caption"].encode("UTF-8"))
+                caption = re.sub('<img([^>]*)src="([^"]*)"([^>]*)>', self.patch_images, post["caption"].encode("UTF-8"))
                 data = generate_page(post, embed, caption)
             elif post["type"] == "chat":
-                text = "<table>"
-                for line in post["dialogue"]:
-                    text += safe_format("<tr><td style='font-weight:bold'>{}</td><td>{}</td></tr>", line["name"], line["phrase"])
-                text += "</table>"
+                if "dialogue" in post:
+                    text = "<table>"
+                    for line in post["dialogue"]:
+                        text += safe_format("<tr><td style='font-weight:bold'>{}</td><td>{}</td></tr>", line["name"], line["phrase"])
+                    text += "</table>"
+                else:
+                    text = ""
                 data = generate_page(post, safe_format("<h1>{}</h1>", post["title"]), text)
             else:
                 raise Exception("Invalid type - "+post["type"])
@@ -331,16 +330,31 @@ class TumblrDownloader(object):
                 os.makedirs(safe_format("{}/{}/", self.folder, folder))
             with open(safe_format("{}/{}/{}", self.folder, folder, file), "w") as f:
                 f.write(data)
-        reactor.callLater(0, self.done)
+
+        self.done()
+
+    def patch_images(self, match):
+        url = match.group(2)
+        if url in self.images:
+            url = safe_format("../{}", self.images[url]["file"])
+        return safe_format("<img{}src='{}'{}>", match.group(1), url, match.group(3))
     
+    @inlineCallbacks
     def done(self):
         self.publish("Compressing")
-        reactor.spawnProcess(TumblrProcess(self, self.cleanup), "/usr/local/bin/7z", ["7z","a","-mx=1","-tzip",safe_format("/mnt/tmp/{}.zip",self.url),self.folder], os.environ, "/mnt", usePTY=True)
+        try:
+            code = yield getProcessValue("/bin/tar", ["-cf", safe_format("./tmp/{}.tar", self.url), "-C", "./tmp/", self.url], os.environ, ".")
+        except:
+            self.publish("Failed to compress archive", True)
+            shutil.rmtree(self.folder)
+        else:
+            self.cleanup()
     
     def cleanup(self):
         self.publish("Finished")
         shutil.rmtree(self.folder)
-        os.rename(safe_format("/mnt/tmp/{}.zip",self.url), safe_format("/mnt/archives/{}.zip",self.url))
+        os.rename(safe_format("./tmp/{}.tar",self.url), safe_format("./archives/{}.tar",self.url))
+        os.chmod(safe_format("./archives/{}.tar",self.url), stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP | stat.S_IROTH)
         self.finished.callback(self.url)
 
 class TumblrUser(Protocol):
@@ -360,6 +374,8 @@ class TumblrUser(Protocol):
                 url = "//"+url
             url = urlparse.urlparse(url).hostname
             print url
+            if os.path.exists(safe_format("./archives/{}.tar", url)):
+                return self.done(url)
             self.channel = url
             self.factory.download(url, self)
             self.factory.subscribe(self, self.channel)
@@ -370,6 +386,8 @@ class TumblrUser(Protocol):
                 self.channels = None
             self.channels = self.factory.downloads.keys()
             for c in self.channels:
+                if self.factory.downloads[c].errored:
+                    continue
                 self.factory.subscribe(self, c)
                 self.messageReceived(c, self.factory.downloads[c].status)
         else:
@@ -377,12 +395,15 @@ class TumblrUser(Protocol):
     
     def messageReceived(self, channel, message):
         self.transport.write(json.dumps({"blog":channel,"message":message}))
+
+    def errorReceived(self, channel, message):
+        self.transport.write(json.dumps({"blog":channel,"error":message}))
     
     def done(self, url):
         if self.channel:
             self.factory.unsubscribe(self, self.channel)
             self.channel = None
-        self.transport.write(json.dumps({"archive":safe_format("archives/{}.zip", url)}))
+        self.transport.write(json.dumps({"archive":safe_format("archives/{}.tar", url)}))
         self.transport.loseConnection()
         return url
     
@@ -399,8 +420,9 @@ class TumblrServer(Factory):
     protocol = TumblrUser
     def __init__(self):
         self.pool = HTTPConnectionPool(reactor)
-        self.pool.retryAutomatically = True
+        self.pool.retryAutomatically = False
         self.pool.maxPersistentPerHost = 10
+        self.pool._factory.noisy = False
         self.channels = {}
         self.downloads = {}
     
@@ -408,6 +430,8 @@ class TumblrServer(Factory):
         if url not in self.downloads:
             self.downloads[url] = TumblrDownloader(self, url)
             self.downloads[url].finished.addCallback(self.done)
+        elif self.downloads[url].errored:
+            p.errorReceived(url, self.downloads[url].status)
         else:
             p.messageReceived(url, self.downloads[url].status)
         self.downloads[url].finished.addCallback(p.done)
@@ -428,26 +452,26 @@ class TumblrServer(Factory):
             if not self.channels[channel]:
                 del self.channels[channel]
     
-    def publish(self, channel, message):
+    def publish(self, channel, message, error=False):
         if channel in self.channels:
             for p in self.channels[channel]:
-                p.messageReceived(channel, message)
+                if error:
+                    p.errorReceived(channel, message)
+                else:
+                    p.messageReceived(channel, message)
 
 # Start the party
-shutil.rmtree("/mnt/tmp")
-os.mkdir("/mnt/tmp")
+shutil.rmtree("./tmp")
+os.mkdir("./tmp")
+
 index_page = File("index.html")
-sockjs_server = SockJSResource(TumblrServer())
+index_page.putChild("sockjs", SockJSResource(TumblrServer()))
+index_page.putChild("archives", File("archives"))
 
 from functools import partial
 def bypass(self, path, request):
     return self
 index_page.getChild = partial(bypass, index_page)
 
-@route('/')
-def index(request):
+def resource():
     return index_page
-
-@route('/sockjs/', branch=True)
-def sockjs(request):
-    return sockjs_server
