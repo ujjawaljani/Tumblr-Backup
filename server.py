@@ -239,7 +239,7 @@ class TumblrDownloader(object):
                 filename = safe_format("{}/{}", self.folder, self.images[image]["file"])
 
                 yield self.request(url, filename)
-
+            "e"
             elif scheme in ("data",):
                 headers = url[5:url.index(",")].split(";")
                 mime = headers[0].split("/")
